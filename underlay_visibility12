@@ -1,0 +1,1473 @@
+#!/usr/bin/env python3
+# Enhanced MTR Script with Rich Metadata Collection and AI Analytics Integration
+# Complete version with improved whois lookups, multiple API sources, and enhanced metadata
+
+import argparse
+import getpass
+import paramiko
+import re
+import sys
+import time
+import threading
+import json
+import os
+from collections import deque
+from flask import Flask, render_template_string, request, jsonify
+
+# Create Flask app
+app = Flask(__name__)
+
+# Global variables
+destinations_data = {}
+lock = threading.Lock()
+
+# AI Analytics Integration - with graceful fallback
+analytics_agent = None
+integration_wrapper = None
+analytics_thread = None
+ai_analytics_available = False
+
+try:
+    from enhanced_mtr_analytics_agent import EnhancedNetworkAnalyticsAgent, EnhancedMTRIntegrationWrapper
+    ai_analytics_available = True
+    print("✅ AI Analytics components loaded successfully")
+except ImportError as e:
+    print(f"❌ Warning: AI Analytics not available - {e}")
+    print("  Continuing with basic monitoring functionality...")
+    
+    class DummyAnalyticsAgent:
+        def __init__(self, **kwargs): pass
+        def get_analytics_summary(self, *args): 
+            return {'status': 'unavailable', 'message': 'AI Analytics not installed'}
+    
+    class DummyIntegrationWrapper:
+        def __init__(self, agent): pass
+        def start_analytics_integration(self, *args): pass
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Enhanced SSH MTR with Rich Metadata and AI Analytics")
+    parser.add_argument('--host', required=True, help="SSH host")
+    parser.add_argument('--user', required=True, help="SSH username")
+    parser.add_argument('--dest', required=True, nargs='+', help="Destination(s) for mtr (up to 3)")
+    parser.add_argument('--enable-analytics', action='store_true', help="Enable AI analytics")
+    parser.add_argument('--port', type=int, default=22, help="SSH port (default: 22)")
+    parser.add_argument('--timeout', type=int, default=10, help="SSH connection timeout")
+    parser.add_argument('--web-port', type=int, default=5000, help="Web interface port")
+    parser.add_argument('--enable-metadata', action='store_true', default=True, help="Enable rich metadata collection")
+    return parser.parse_args()
+
+def collect_hop_metadata(client, hop_ip):
+    """Enhanced metadata collection with multiple data sources and improved reliability."""
+    metadata = {
+        'hostname': None, 'asn': None, 'organization': None, 'country': None,
+        'city': None, 'ping_stats': None, 'ping_packet_loss': None,
+        'http_connectivity': None, 'whois_info': None, 'region': None,
+        'provider': None, 'network_name': None
+    }
+    
+    if hop_ip in ['Unknown', '???', ''] or not hop_ip:
+        return metadata
+    
+    print(f"  -> Starting enhanced metadata collection for {hop_ip}")
+    
+    try:
+        # Skip metadata collection for private/invalid IPs and hostnames
+        if hop_ip.startswith(('192.168.', '10.', '172.16.', '172.17.', '172.18.', '172.19.', 
+                             '172.20.', '172.21.', '172.22.', '172.23.', '172.24.', '172.25.',
+                             '172.26.', '172.27.', '172.28.', '172.29.', '172.30.', '172.31.')) or \
+           '-' in hop_ip or not hop_ip.replace('.', '').isdigit():
+            print(f"     Skipping private/hostname IP: {hop_ip}")
+            # Still collect ping stats for private IPs
+            try:
+                _, stdout, _ = client.exec_command(f'ping -c 3 -W 2 {hop_ip} 2>/dev/null')
+                ping_output = stdout.read().decode()
+                
+                loss_match = re.search(r'(\d+)% packet loss', ping_output)
+                if loss_match:
+                    metadata['ping_packet_loss'] = int(loss_match.group(1))
+                    print(f"     Ping packet loss: {metadata['ping_packet_loss']}%")
+                
+                if 'min/avg/max' in ping_output:
+                    stats_match = re.search(r'(\d+\.?\d*)/(\d+\.?\d*)/(\d+\.?\d*)/(\d+\.?\d*)', ping_output)
+                    if stats_match:
+                        metadata['ping_stats'] = {
+                            'min': float(stats_match.group(1)),
+                            'avg': float(stats_match.group(2)),
+                            'max': float(stats_match.group(3)),
+                            'stddev': float(stats_match.group(4))
+                        }
+                        print(f"     Ping avg: {metadata['ping_stats']['avg']}ms")
+            except:
+                pass
+            return metadata
+        
+        # 1. Reverse DNS lookup
+        try:
+            _, stdout, _ = client.exec_command(f'dig +short -x {hop_ip} 2>/dev/null | head -1')
+            hostname = stdout.read().decode().strip()
+            if hostname and not hostname.startswith(';;') and '.' in hostname:
+                metadata['hostname'] = hostname.rstrip('.')
+                print(f"     Found hostname: {metadata['hostname']}")
+        except Exception as e:
+            print(f"     DNS lookup failed: {e}")
+        
+        # 2. Enhanced ping test with more statistics
+        try:
+            _, stdout, _ = client.exec_command(f'ping -c 10 -W 3 {hop_ip} 2>/dev/null')
+            ping_output = stdout.read().decode()
+            
+            loss_match = re.search(r'(\d+)% packet loss', ping_output)
+            if loss_match:
+                metadata['ping_packet_loss'] = int(loss_match.group(1))
+                print(f"     Ping packet loss: {metadata['ping_packet_loss']}%")
+            
+            if 'min/avg/max' in ping_output:
+                stats_match = re.search(r'(\d+\.?\d*)/(\d+\.?\d*)/(\d+\.?\d*)/(\d+\.?\d*)', ping_output)
+                if stats_match:
+                    metadata['ping_stats'] = {
+                        'min': float(stats_match.group(1)),
+                        'avg': float(stats_match.group(2)),
+                        'max': float(stats_match.group(3)),
+                        'stddev': float(stats_match.group(4))
+                    }
+                    print(f"     Ping avg: {metadata['ping_stats']['avg']}ms")
+        except Exception as e:
+            print(f"     Ping test failed: {e}")
+        
+        # 3. HTTP connectivity test
+        try:
+            _, stdout, _ = client.exec_command(f'timeout 3 nc -z {hop_ip} 80 2>/dev/null && echo "OPEN" || echo "CLOSED"')
+            result = stdout.read().decode().strip()
+            metadata['http_connectivity'] = result
+            if result == "OPEN":
+                print(f"     HTTP port 80: OPEN")
+        except Exception as e:
+            print(f"     HTTP connectivity test failed: {e}")
+        
+        # 4. Multiple API sources for geolocation and ASN data
+        api_sources = [
+            {
+                'name': 'ipapi.co',
+                'url': f'https://ipapi.co/{hop_ip}/json/',
+                'timeout': 5
+            },
+            {
+                'name': 'ip-api.com',
+                'url': f'http://ip-api.com/json/{hop_ip}',
+                'timeout': 5
+            },
+            {
+                'name': 'ipinfo.io',
+                'url': f'https://ipinfo.io/{hop_ip}/json',
+                'timeout': 5
+            }
+        ]
+        
+        # Try API sources first (usually more reliable than whois)
+        for api_source in api_sources:
+            try:
+                print(f"     Trying API source: {api_source['name']}")
+                _, stdout, stderr = client.exec_command(
+                    f'curl -s --max-time {api_source["timeout"]} --connect-timeout 3 "{api_source["url"]}" 2>/dev/null'
+                )
+                api_output = stdout.read().decode().strip()
+                
+                if not api_output or len(api_output) < 20:
+                    print(f"     API {api_source['name']}: No response or too short")
+                    continue
+                
+                try:
+                    data = json.loads(api_output)
+                    
+                    # Handle different API response formats
+                    if api_source['name'] == 'ipapi.co':
+                        if data.get('error'):
+                            print(f"     API error: {data.get('reason', 'Unknown error')}")
+                            continue
+                        
+                        if data.get('org') and data.get('org') != 'AS':
+                            metadata['organization'] = data['org']
+                        if data.get('country'):
+                            metadata['country'] = data['country']
+                        if data.get('city'):
+                            metadata['city'] = data['city']
+                        if data.get('region'):
+                            metadata['region'] = data['region']
+                        if data.get('asn'):
+                            asn_clean = str(data['asn']).replace('AS', '')
+                            metadata['asn'] = f"AS{asn_clean}"
+                    
+                    elif api_source['name'] == 'ip-api.com':
+                        if data.get('status') == 'fail':
+                            print(f"     API error: {data.get('message', 'Unknown error')}")
+                            continue
+                        
+                        if data.get('org'):
+                            metadata['organization'] = data['org']
+                        if data.get('isp'):
+                            metadata['provider'] = data['isp']
+                        if data.get('country'):
+                            metadata['country'] = data['country']
+                        if data.get('countryCode'):
+                            metadata['country'] = data['countryCode']
+                        if data.get('city'):
+                            metadata['city'] = data['city']
+                        if data.get('regionName'):
+                            metadata['region'] = data['regionName']
+                        if data.get('as'):
+                            # Format: "AS15169 Google LLC"
+                            as_info = data['as']
+                            as_match = re.match(r'AS(\d+)\s*(.*)', as_info)
+                            if as_match:
+                                metadata['asn'] = f"AS{as_match.group(1)}"
+                                if as_match.group(2).strip():
+                                    metadata['organization'] = as_match.group(2).strip()
+                    
+                    elif api_source['name'] == 'ipinfo.io':
+                        if data.get('bogon'):
+                            print(f"     API reports bogon IP")
+                            continue
+                        
+                        if data.get('org'):
+                            # Format: "AS15169 Google LLC"
+                            org_info = data['org']
+                            as_match = re.match(r'AS(\d+)\s*(.*)', org_info)
+                            if as_match:
+                                metadata['asn'] = f"AS{as_match.group(1)}"
+                                if as_match.group(2).strip():
+                                    metadata['organization'] = as_match.group(2).strip()
+                            else:
+                                metadata['organization'] = org_info
+                        
+                        if data.get('country'):
+                            metadata['country'] = data['country']
+                        if data.get('city'):
+                            metadata['city'] = data['city']
+                        if data.get('region'):
+                            metadata['region'] = data['region']
+                    
+                    # Check if we got good data
+                    if metadata['asn'] or metadata['organization'] or metadata['country']:
+                        collected_items = []
+                        if metadata['asn']: collected_items.append(f"ASN: {metadata['asn']}")
+                        if metadata['organization']: collected_items.append(f"Org: {metadata['organization'][:20]}...")
+                        if metadata['country']: collected_items.append(f"Country: {metadata['country']}")
+                        if metadata['city']: collected_items.append(f"City: {metadata['city']}")
+                        if metadata['region']: collected_items.append(f"Region: {metadata['region']}")
+                        if metadata['provider']: collected_items.append(f"ISP: {metadata['provider'][:15]}...")
+                        
+                        print(f"     API {api_source['name']} success: {', '.join(collected_items[:3])}")
+                        break  # Stop trying other APIs if we got good data
+                
+                except json.JSONDecodeError:
+                    print(f"     API {api_source['name']}: Invalid JSON response")
+                    continue
+                    
+            except Exception as e:
+                print(f"     API {api_source['name']} failed: {e}")
+                continue
+        
+        # 5. Fallback to traditional whois if APIs didn't provide complete data
+        if not metadata['asn'] or not metadata['organization']:
+            try:
+                print(f"     Trying whois fallback for missing data...")
+                
+                # Use multiple whois commands
+                whois_commands = [
+                    f'whois {hop_ip}',
+                    f'whois -h whois.arin.net {hop_ip}',
+                    f'whois -h whois.ripe.net {hop_ip}',
+                    f'whois -h whois.apnic.net {hop_ip}'
+                ]
+                
+                for cmd in whois_commands:
+                    try:
+                        _, stdout, stderr = client.exec_command(f'{cmd} 2>/dev/null | head -50')
+                        whois_output = stdout.read().decode()
+                        
+                        if len(whois_output) < 100 or 'No Data' in whois_output or 'Error:' in whois_output:
+                            continue
+                        
+                        # Extract ASN if not already found
+                        if not metadata['asn']:
+                            asn_patterns = [
+                                r'OriginAS:\s*AS?(\d+)', r'origin:\s*AS(\d+)', 
+                                r'ASNumber:\s*(\d+)', r'aut-num:\s*AS(\d+)',
+                                r'ASN:\s*(\d+)', r'autonomous system number:\s*(\d+)'
+                            ]
+                            for pattern in asn_patterns:
+                                asn_match = re.search(pattern, whois_output, re.IGNORECASE)
+                                if asn_match:
+                                    metadata['asn'] = f"AS{asn_match.group(1)}"
+                                    print(f"     Whois found ASN: {metadata['asn']}")
+                                    break
+                        
+                        # Extract organization if not already found
+                        if not metadata['organization']:
+                            org_patterns = [
+                                r'OrgName:\s*(.+)', r'org-name:\s*(.+)', 
+                                r'Organization:\s*(.+)', r'descr:\s*(.+)',
+                                r'NetName:\s*(.+)', r'org:\s*(.+)'
+                            ]
+                            for pattern in org_patterns:
+                                org_match = re.search(pattern, whois_output, re.IGNORECASE)
+                                if org_match:
+                                    org_name = org_match.group(1).strip()
+                                    if org_name and len(org_name) > 3 and not org_name.startswith('#'):
+                                        metadata['organization'] = org_name
+                                        print(f"     Whois found organization: {org_name}")
+                                        break
+                        
+                        # Extract country if not already found
+                        if not metadata['country']:
+                            country_patterns = [r'Country:\s*([A-Z]{2})', r'country:\s*([A-Z]{2})', r'CountryCode:\s*([A-Z]{2})']
+                            for pattern in country_patterns:
+                                country_match = re.search(pattern, whois_output, re.IGNORECASE)
+                                if country_match:
+                                    metadata['country'] = country_match.group(1).upper()
+                                    print(f"     Whois found country: {metadata['country']}")
+                                    break
+                        
+                        # If we got some data, break out of whois loop
+                        if metadata['asn'] or metadata['organization']:
+                            break
+                            
+                    except Exception as e:
+                        print(f"     Whois command '{cmd.split()[1] if len(cmd.split()) > 1 else cmd}' failed: {e}")
+                        continue
+                        
+            except Exception as e:
+                print(f"     All whois methods failed: {e}")
+        
+        # Summary of collected data
+        collected_items = []
+        if metadata['hostname']: collected_items.append('hostname')
+        if metadata['asn']: collected_items.append('ASN')
+        if metadata['organization']: collected_items.append('organization')
+        if metadata['provider']: collected_items.append('provider')
+        if metadata['country']: collected_items.append('country')
+        if metadata['region']: collected_items.append('region')
+        if metadata['city']: collected_items.append('city')
+        if metadata['ping_stats']: collected_items.append('ping')
+        if metadata['http_connectivity']: collected_items.append('http')
+        
+        if collected_items:
+            print(f"  -> Metadata collection SUCCESS for {hop_ip}: {', '.join(collected_items)}")
+        else:
+            print(f"  -> Metadata collection found limited data for {hop_ip}")
+            
+    except Exception as e:
+        print(f"  -> ERROR collecting metadata for {hop_ip}: {e}")
+    
+    return metadata
+
+def parse_mtr_output(output):
+    """Parse MTR output with enhanced error handling."""
+    hops = []
+    patterns = [
+        re.compile(r'^\s*(\d+)\.\|--\s*([^\s]+)\s+(\d+\.\d+%)\s+(\d+)\s+(\d+\.\d+)\s+(\d+\.\d+)\s+(\d+\.\d+)\s+(\d+\.\d+)\s+(\d+\.\d+)'),
+        re.compile(r'^\s*(\d+)\.\|--\s*([^\s]+)\s+(\d+\.\d+%)\s+(\d+)\s+(\d+\.\d+)\s+(\d+\.\d+)\s+(\d+\.\d+)\s+(\d+\.\d+)'),
+        re.compile(r'^\s*(\d+)\.\|--\s*(\?\?\?)\s+(\d+\.\d+)\s+(\d+)\s+(\d+\.\d+)\s+(\d+\.\d+)\s+(\d+\.\d+)\s+(\d+\.\d+)\s+(\d+\.\d+)'),
+        re.compile(r'^\s*(\d+)\.\|--\s*(\?\?\?)\s+(\d+\.\d+%)')
+    ]
+    
+    for line in output.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+            
+        for pattern in patterns:
+            match = pattern.match(line)
+            if match:
+                groups = match.groups()
+                hop_num = int(groups[0])
+                host = groups[1] if groups[1] != '???' else 'Unknown'
+                
+                try:
+                    loss_str = groups[2]
+                    loss = float(loss_str.rstrip('%')) if '%' in loss_str else float(loss_str)
+                except (ValueError, IndexError):
+                    loss = 100.0 if host == 'Unknown' else 0.0
+                
+                try:
+                    if len(groups) >= 8:
+                        last = float(groups[4]) if groups[4] != '???' else 0.0
+                        avg = float(groups[5]) if groups[5] != '???' else 0.0
+                        best = float(groups[6]) if groups[6] != '???' else 0.0
+                        worst = float(groups[7]) if groups[7] != '???' else 0.0
+                        stddev = float(groups[8]) if len(groups) > 8 and groups[8] != '???' else 0.0
+                    else:
+                        avg = last = best = worst = stddev = 0.0
+                except (ValueError, IndexError):
+                    avg = last = best = worst = stddev = 0.0
+                
+                hops.append({
+                    'count': hop_num,
+                    'host': host,
+                    'Loss%': loss,
+                    'Avg': avg,
+                    'Last': last,
+                    'Best': best,
+                    'Worst': worst,
+                    'StdDev': stddev
+                })
+                break
+    
+    return hops
+
+def get_hop_stats(dest, hop_id, time_window_minutes=5):
+    """Get statistics for a specific hop over a time window."""
+    cutoff_time = time.time() - (time_window_minutes * 60)
+    values = {'latency': [], 'loss': [], 'jitter': []}
+    
+    with lock:
+        if dest not in destinations_data:
+            return {'avg_latency': 0, 'avg_loss': 0, 'max_latency': 0, 'jitter': 0, 'status': 'no-data'}
+        
+        for entry in destinations_data[dest]['history']:
+            if entry['ts'] >= cutoff_time and 'hops' in entry:
+                for hop in entry['hops']:
+                    if hop['count'] == hop_id:
+                        values['latency'].append(hop['Avg'])
+                        values['loss'].append(hop['Loss%'])
+                        values['jitter'].append(hop.get('StdDev', 0))
+    
+    if not values['latency']:
+        return {'avg_latency': 0, 'avg_loss': 0, 'max_latency': 0, 'jitter': 0, 'status': 'no-data'}
+    
+    avg_latency = sum(values['latency']) / len(values['latency'])
+    avg_loss = sum(values['loss']) / len(values['loss'])
+    max_latency = max(values['latency'])
+    avg_jitter = sum(values['jitter']) / len(values['jitter']) if values['jitter'] else 0
+    
+    if avg_loss > 10:
+        status = 'critical'
+    elif avg_loss > 5 or avg_latency > 200:
+        status = 'warning'
+    elif avg_loss > 0 or avg_jitter > 10:
+        status = 'minor'
+    else:
+        status = 'healthy'
+    
+    return {
+        'avg_latency': round(avg_latency, 1),
+        'avg_loss': round(avg_loss, 1),
+        'max_latency': round(max_latency, 1),
+        'jitter': round(avg_jitter, 1),
+        'status': status
+    }
+
+def test_mtr_availability(client):
+    """Test if MTR is available on the remote system."""
+    try:
+        _, stdout, stderr = client.exec_command('which mtr || which mtr-tiny')
+        mtr_path = stdout.read().decode().strip()
+        
+        if not mtr_path:
+            return False, "MTR not found in PATH"
+        
+        _, stdout, stderr = client.exec_command(f'{mtr_path} --version 2>&1 | head -1')
+        version_output = stdout.read().decode().strip()
+        
+        if 'mtr' in version_output.lower():
+            return True, f"MTR found: {version_output}"
+        else:
+            return False, f"MTR test failed: {version_output}"
+            
+    except Exception as e:
+        return False, f"MTR test error: {str(e)}"
+
+def mtr_loop_for_dest(client, dest, host, enable_metadata=True):
+    """Enhanced MTR loop with improved metadata collection."""
+    consecutive_errors = 0
+    max_consecutive_errors = 5
+    metadata_cache = {}
+    metadata_refresh_interval = 600  # 10 minutes
+    
+    os.makedirs("mtr_logs", exist_ok=True)
+    
+    while True:
+        try:
+            ts = time.time()
+            
+            # Try different MTR commands
+            for cmd in [f'mtr -r -c 10 {dest}', f'mtr -r -c 5 {dest}', f'mtr --report --report-cycles=10 {dest}']:
+                try:
+                    _, stdout, stderr = client.exec_command(cmd)
+                    output = stdout.read().decode()
+                    error_output = stderr.read().decode()
+                    
+                    if output and not error_output:
+                        break
+                except Exception as cmd_error:
+                    print(f"Command '{cmd}' failed: {cmd_error}")
+                    continue
+            
+            with lock:
+                if dest not in destinations_data:
+                    destinations_data[dest] = {
+                        'history': deque(maxlen=360),
+                        'latest_host': host,
+                        'analytics_insights': [],
+                        'hop_metadata': {}
+                    }
+                
+                if error_output and not output:
+                    entry = {'ts': ts, 'error': f"mtr error: {error_output[:100]}"}
+                    consecutive_errors += 1
+                else:
+                    hops = parse_mtr_output(output)
+                    if not hops:
+                        entry = {'ts': ts, 'error': "No hops returned by mtr or parsing failed."}
+                        consecutive_errors += 1
+                    else:
+                        # Enhanced metadata collection for new or stale hops
+                        if enable_metadata:
+                            for hop in hops:
+                                hop_ip = hop['host']
+                                should_collect = (
+                                    hop_ip not in metadata_cache or 
+                                    (ts - metadata_cache.get(hop_ip, {}).get('last_updated', 0)) > metadata_refresh_interval
+                                )
+                                
+                                if should_collect and hop_ip not in ['Unknown', '???']:
+                                    print(f"Collecting enhanced metadata for hop {hop['count']}: {hop_ip}")
+                                    metadata = collect_hop_metadata(client, hop_ip)
+                                    metadata['last_updated'] = ts
+                                    metadata_cache[hop_ip] = metadata
+                                    destinations_data[dest]['hop_metadata'][hop_ip] = metadata
+                        
+                        entry = {'ts': ts, 'hops': hops}
+                        consecutive_errors = 0
+                
+                destinations_data[dest]['history'].append(entry)
+                
+                # Trim history to last 1 hour
+                min_ts = time.time() - 3600
+                while destinations_data[dest]['history'] and destinations_data[dest]['history'][0]['ts'] < min_ts:
+                    destinations_data[dest]['history'].popleft()
+            
+            sleep_time = 30 if consecutive_errors >= max_consecutive_errors else 10
+            time.sleep(sleep_time)
+                
+        except Exception as e:
+            print(f"Error in MTR loop for {dest}: {str(e)}")
+            consecutive_errors += 1
+            time.sleep(15)
+
+# API Routes
+@app.route('/api/debug/<dest>')
+def debug_metadata(dest):
+    """Debug endpoint to see what metadata is stored"""
+    with lock:
+        if dest in destinations_data:
+            debug_data = {
+                'destination': dest,
+                'hop_metadata_keys': list(destinations_data[dest].get('hop_metadata', {}).keys()),
+                'hop_metadata': destinations_data[dest].get('hop_metadata', {}),
+                'latest_hops': []
+            }
+            
+            history = destinations_data[dest]['history']
+            if history and 'hops' in history[-1]:
+                debug_data['latest_hops'] = [
+                    {'count': hop['count'], 'host': hop['host']} 
+                    for hop in history[-1]['hops']
+                ]
+            
+            return jsonify(debug_data)
+    return jsonify({'error': 'Destination not found'}), 404
+
+@app.route('/api/hop-metadata/<dest>/<hop_ip>')
+def get_hop_metadata_api(dest, hop_ip):
+    """Get metadata for a specific hop IP"""
+    with lock:
+        if dest in destinations_data and hop_ip in destinations_data[dest].get('hop_metadata', {}):
+            return jsonify(destinations_data[dest]['hop_metadata'][hop_ip])
+    return jsonify({'error': 'Metadata not found'}), 404
+
+@app.route('/api/analytics/<dest>')
+def get_analytics(dest):
+    """Get AI analytics for a specific destination"""
+    if not ai_analytics_available or not analytics_agent:
+        return jsonify({'error': 'AI Analytics not available', 'status': 'disabled'}), 200
+    
+    try:
+        summary = analytics_agent.get_analytics_summary(dest, 24)
+        return jsonify(summary)
+    except Exception as e:
+        return jsonify({'error': str(e), 'status': 'error'}), 500
+
+@app.route('/api/insights/<dest>')
+def get_insights(dest):
+    """Get latest AI insights for a destination"""
+    if not ai_analytics_available:
+        return jsonify([])
+    
+    with lock:
+        if dest in destinations_data and destinations_data[dest].get('analytics_insights'):
+            latest_insights = destinations_data[dest]['analytics_insights'][-5:]
+            return jsonify([
+                {
+                    'timestamp': insight.timestamp.isoformat() if hasattr(insight.timestamp, 'isoformat') else str(insight.timestamp),
+                    'health': getattr(insight, 'overall_health', 'unknown'),
+                    'issues': getattr(insight, 'primary_issues', []),
+                    'root_cause': getattr(insight, 'root_cause_analysis', ''),
+                    'recommendations': getattr(insight, 'recommendations', []),
+                    'confidence': getattr(insight, 'confidence_score', 0.0)
+                }
+                for insight in latest_insights
+            ])
+    return jsonify([])
+
+@app.route('/api/status')
+def get_status():
+    """Get system status"""
+    with lock:
+        status = {
+            'destinations': list(destinations_data.keys()),
+            'ai_analytics': ai_analytics_available,
+            'total_measurements': sum(len(data['history']) for data in destinations_data.values()),
+            'total_metadata_entries': sum(len(data.get('hop_metadata', {})) for data in destinations_data.values()),
+            'uptime': time.time() - app.start_time if hasattr(app, 'start_time') else 0
+        }
+    return jsonify(status)
+
+@app.route('/')
+def index():
+    selected_dest = request.args.get('dest')
+    
+    with lock:
+        available_dests = list(destinations_data.keys())
+        print(f"DEBUG: Available destinations: {available_dests}")
+        
+        if not available_dests:
+            print("DEBUG: No destinations available yet, showing loading template")
+            return render_template_string(loading_template)
+        
+        if not selected_dest or selected_dest not in available_dests:
+            selected_dest = available_dests[0]
+        
+        dest_data = destinations_data[selected_dest]
+        history_data = list(dest_data['history'])
+        print(f"DEBUG: History data length for {selected_dest}: {len(history_data)}")
+        
+        # Check if we have any actual hop data
+        has_hop_data = False
+        for entry in history_data:
+            if 'hops' in entry and entry['hops']:
+                has_hop_data = True
+                print(f"DEBUG: Found hop data with {len(entry['hops'])} hops")
+                break
+        
+        if not has_hop_data:
+            print("DEBUG: No hop data available yet, showing loading template")
+            return render_template_string(loading_template)
+        
+        host = dest_data['latest_host']
+        hop_metadata = dest_data.get('hop_metadata', {})
+        latest_insights = dest_data.get('analytics_insights', [])[-3:]
+
+    latest_hops = []
+    hop_stats = {}
+    if history_data and 'hops' in history_data[-1]:
+        latest_hops = history_data[-1]['hops']
+        print(f"DEBUG: Latest hops: {[f'Hop {h['count']}: {h['host']}' for h in latest_hops]}")
+        for hop in latest_hops:
+            hop_stats[hop['count']] = get_hop_stats(selected_dest, hop['count'])
+
+    error_message = None
+    last_update = time.strftime("%H:%M:%S")
+    
+    if history_data and 'error' in history_data[-1]:
+        error_message = history_data[-1]['error']
+        print(f"DEBUG: Error message: {error_message}")
+    
+    print(f"DEBUG: Rendering main template for {selected_dest}")
+    return render_template_string(
+        main_template, 
+        host=host, dest=selected_dest, available_destinations=available_dests,
+        selected_destination=selected_dest, history_data=history_data,
+        history_json=json.dumps(history_data), latest_hops=latest_hops,
+        hop_stats=hop_stats, hop_metadata=hop_metadata,
+        hop_metadata_json=json.dumps(hop_metadata), error_message=error_message,
+        last_update=last_update, ai_insights=latest_insights,
+        analytics_enabled=ai_analytics_available and analytics_thread is not None
+    )
+
+def start_ai_analytics():
+    """Start AI analytics integration"""
+    global analytics_thread, analytics_agent, integration_wrapper
+    
+    if not ai_analytics_available:
+        return False
+    
+    try:
+        analytics_agent = EnhancedNetworkAnalyticsAgent(db_path="network_analytics.db")
+        integration_wrapper = EnhancedMTRIntegrationWrapper(analytics_agent)
+        
+        if analytics_thread is None:
+            analytics_thread = threading.Thread(
+                target=integration_wrapper.start_analytics_integration,
+                args=(destinations_data, lock), daemon=True
+            )
+            analytics_thread.start()
+            print("AI Analytics started")
+            return True
+    except Exception as e:
+        print(f"Failed to start AI Analytics: {e}")
+        return False
+
+# Templates
+loading_template = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Enhanced MTR - Loading</title>
+    <meta http-equiv="refresh" content="5">
+    <style>
+        body { 
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', sans-serif; 
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh; display: flex; align-items: center; justify-content: center; margin: 0;
+        }
+        .loading {
+            background: rgba(255, 255, 255, 0.95); backdrop-filter: blur(10px); color: #333;
+            padding: 60px; border-radius: 20px; text-align: center; font-size: 1.4em;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.2); max-width: 500px;
+        }
+        .spinner {
+            width: 50px; height: 50px; border: 5px solid #ecf0f1; border-top: 5px solid #3498db;
+            border-radius: 50%; animation: spin 1s linear infinite; margin: 0 auto 20px;
+        }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+    </style>
+</head>
+<body>
+    <div class="loading">
+        <div class="spinner"></div>
+        <h2>Initializing Enhanced Network Analysis</h2>
+        <p>Collecting data, gathering metadata, and starting AI analytics...</p>
+    </div>
+</body>
+</html>
+"""
+
+# Main template with enhanced metadata display
+main_template = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Enhanced MTR with Rich Metadata - {{ dest }}</title>
+    <meta http-equiv="refresh" content="10">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { 
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; 
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh; color: #333;
+        }
+        .container { max-width: 1600px; margin: 0 auto; padding: 20px; }
+        .header {
+            background: rgba(255, 255, 255, 0.95); backdrop-filter: blur(10px);
+            border-radius: 20px; padding: 30px; margin-bottom: 30px;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.1); text-align: center; position: relative;
+        }
+        .metadata-badge {
+            position: absolute; top: 15px; left: 20px;
+            background: linear-gradient(135deg, #3498db, #2980b9); color: white;
+            padding: 8px 16px; border-radius: 15px; font-size: 0.8em; font-weight: 600;
+        }
+        .ai-badge {
+            position: absolute; top: 15px; right: 20px;
+            background: linear-gradient(135deg, #e74c3c, #c0392b); color: white;
+            padding: 8px 16px; border-radius: 15px; font-size: 0.8em; font-weight: 600;
+        }
+        .ai-badge.disabled { background: linear-gradient(135deg, #95a5a6, #7f8c8d); }
+        .header h1 { font-size: 2.5em; color: #2c3e50; margin-bottom: 10px; font-weight: 300; }
+        .destination-selector {
+            margin: 20px 0; display: flex; justify-content: center; gap: 15px; flex-wrap: wrap;
+        }
+        .dest-button {
+            background: linear-gradient(135deg, #3498db, #2980b9); color: white; border: none;
+            padding: 12px 24px; border-radius: 25px; font-size: 1em; font-weight: 600;
+            cursor: pointer; transition: all 0.3s ease; text-decoration: none; display: inline-block;
+            box-shadow: 0 5px 15px rgba(52, 152, 219, 0.3);
+        }
+        .dest-button:hover { transform: translateY(-2px); box-shadow: 0 8px 25px rgba(52, 152, 219, 0.4); }
+        .dest-button.active { background: linear-gradient(135deg, #e74c3c, #c0392b); }
+        .path-info {
+            display: flex; justify-content: center; gap: 40px; margin-top: 20px;
+            font-size: 1.1em; color: #7f8c8d; flex-wrap: wrap;
+        }
+        .path-container {
+            background: rgba(255, 255, 255, 0.95); backdrop-filter: blur(10px);
+            border-radius: 20px; padding: 40px; margin-bottom: 30px;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.1); overflow-x: auto;
+        }
+        .network-path {
+            display: flex; align-items: center; justify-content: space-between;
+            min-width: max-content; padding: 20px 0; position: relative;
+        }
+        .hop {
+            display: flex; flex-direction: column; align-items: center;
+            position: relative; min-width: 180px; z-index: 2;
+        }
+        .hop-node {
+            width: 60px; height: 60px; border-radius: 50%; display: flex; align-items: center;
+            justify-content: center; font-weight: bold; color: white; font-size: 1.1em;
+            margin-bottom: 15px; box-shadow: 0 8px 30px rgba(0, 0, 0, 0.15);
+            border: 4px solid white; transition: all 0.3s ease; cursor: pointer;
+        }
+        .hop-node:hover { transform: scale(1.1); box-shadow: 0 12px 40px rgba(0, 0, 0, 0.2); }
+        .hop-node.healthy { background: linear-gradient(135deg, #2ecc71, #27ae60); }
+        .hop-node.minor { background: linear-gradient(135deg, #f39c12, #e67e22); }
+        .hop-node.warning { background: linear-gradient(135deg, #e74c3c, #c0392b); }
+        .hop-node.critical { background: linear-gradient(135deg, #8e44ad, #9b59b6); animation: pulse 2s infinite; }
+        .hop-node.no-data { background: linear-gradient(135deg, #95a5a6, #7f8c8d); }
+        @keyframes pulse { 0% { transform: scale(1); } 50% { transform: scale(1.05); } 100% { transform: scale(1); } }
+        
+        .hop-info {
+            text-align: center; background: white; border-radius: 15px; padding: 15px;
+            box-shadow: 0 5px 20px rgba(0, 0, 0, 0.1); border: 2px solid #ecf0f1; min-width: 180px;
+        }
+        .hop-host { font-weight: 600; color: #2c3e50; margin-bottom: 8px; font-size: 0.9em; word-break: break-all; }
+        .hop-stats { display: flex; flex-direction: column; gap: 5px; }
+        .stat { display: flex; justify-content: space-between; font-size: 0.85em; color: #7f8c8d; }
+        .stat-value { font-weight: 600; color: #2c3e50; }
+        
+        .metadata-info-preview {
+            background: #f0f8ff; border-radius: 8px; padding: 12px; margin-top: 10px;
+            font-size: 0.75em; text-align: left; border-left: 3px solid #3498db;
+            border: 1px solid #e1f0ff;
+        }
+        .metadata-info-detailed {
+            background: #f8f9fa; border-radius: 8px; padding: 12px; margin-top: 8px;
+            font-size: 0.8em; text-align: left; border-left: 3px solid #2980b9;
+            border: 1px solid #e9ecef; display: none;
+        }
+        .metadata-row { margin: 4px 0; }
+        .metadata-row-small { margin: 3px 0; font-size: 0.85em; }
+        .metadata-label { font-weight: 600; color: #555; }
+        .metadata-expand {
+            background: #3498db; color: white; border: none; padding: 4px 8px;
+            border-radius: 12px; font-size: 0.7em; cursor: pointer; margin-top: 5px;
+            transition: background 0.3s ease;
+        }
+        .metadata-expand:hover { background: #2980b9; }
+        
+        .connection-line {
+            position: absolute; height: 4px; background: linear-gradient(90deg, #3498db, #2980b9);
+            top: 50%; transform: translateY(-50%); z-index: 1; border-radius: 2px;
+            box-shadow: 0 2px 10px rgba(52, 152, 219, 0.3);
+        }
+        
+        .charts-section {
+            display: grid; grid-template-columns: 1fr 1fr; gap: 30px; margin-bottom: 30px;
+        }
+        .chart-container {
+            background: rgba(255, 255, 255, 0.95); backdrop-filter: blur(10px);
+            border-radius: 20px; padding: 30px; box-shadow: 0 20px 60px rgba(0, 0, 0, 0.1);
+            height: 400px; display: flex; flex-direction: column;
+        }
+        .chart-wrapper { flex: 1; position: relative; min-height: 0; }
+        .chart-title { font-size: 1.4em; color: #2c3e50; margin-bottom: 20px; text-align: center; font-weight: 300; }
+        
+        .ai-insights-section {
+            background: rgba(255, 255, 255, 0.95); backdrop-filter: blur(10px);
+            border-radius: 20px; padding: 30px; margin-top: 30px;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.1);
+        }
+        .ai-insights-title {
+            font-size: 1.6em; color: #2c3e50; margin-bottom: 20px;
+            display: flex; align-items: center; gap: 10px;
+        }
+        .insight-card {
+            background: linear-gradient(135deg, #f8f9fa, #e9ecef);
+            border-radius: 15px; padding: 20px; margin-bottom: 15px;
+            border-left: 5px solid #3498db; transition: transform 0.3s ease;
+        }
+        .insight-card:hover { transform: translateY(-2px); box-shadow: 0 5px 20px rgba(0, 0, 0, 0.1); }
+        .insight-card.warning { border-left-color: #f39c12; background: linear-gradient(135deg, #fef9e7, #fcf3cf); }
+        .insight-card.critical { border-left-color: #e74c3c; background: linear-gradient(135deg, #fdedec, #fadbd8); }
+        
+        .error {
+            background: linear-gradient(135deg, #e74c3c, #c0392b); color: white;
+            padding: 30px; border-radius: 20px; text-align: center; font-size: 1.2em;
+            box-shadow: 0 20px 60px rgba(231, 76, 60, 0.3);
+        }
+        .status-legend {
+            display: flex; justify-content: center; gap: 30px; margin: 30px 0; flex-wrap: wrap;
+        }
+        .legend-item { display: flex; align-items: center; gap: 10px; font-size: 0.9em; color: #7f8c8d; }
+        .legend-dot {
+            width: 20px; height: 20px; border-radius: 50%; border: 2px solid white;
+            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+        }
+        .legend-dot.healthy { background: linear-gradient(135deg, #2ecc71, #27ae60); }
+        .legend-dot.minor { background: linear-gradient(135deg, #f39c12, #e67e22); }
+        .legend-dot.warning { background: linear-gradient(135deg, #e74c3c, #c0392b); }
+        .legend-dot.critical { background: linear-gradient(135deg, #8e44ad, #9b59b6); }
+        
+        @media (max-width: 768px) {
+            .charts-section { grid-template-columns: 1fr; }
+            .path-info { flex-direction: column; gap: 20px; }
+            .status-legend { flex-direction: column; align-items: center; gap: 15px; }
+            .destination-selector { flex-direction: column; align-items: center; }
+            .ai-badge, .metadata-badge { position: static; margin: 10px auto; }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <div class="metadata-badge">Enhanced Metadata Active</div>
+            {% if analytics_enabled %}
+            <div class="ai-badge">AI Analytics Active</div>
+            {% else %}
+            <div class="ai-badge disabled">AI Analytics Disabled</div>
+            {% endif %}
+            <h1>Enhanced MTR Network Path Analysis</h1>
+            
+            <div class="destination-selector">
+                {% for dest_option in available_destinations %}
+                    <a href="?dest={{ dest_option }}" 
+                       class="dest-button {% if dest_option == selected_destination %}active{% endif %}">
+                        {{ dest_option }}
+                    </a>
+                {% endfor %}
+            </div>
+            
+            <div class="path-info">
+                <div><strong>Source:</strong> {{ host }}</div>
+                <div><strong>Current Destination:</strong> {{ dest }}</div>
+                <div><strong>Last Updated:</strong> <span id="lastUpdate">{{ last_update }}</span></div>
+                <div><strong>Metadata Entries:</strong> {{ hop_metadata|length }} hops</div>
+            </div>
+        </div>
+        
+        {% if error_message %}
+            <div class="error">{{ error_message }}</div>
+        {% elif not latest_hops %}
+            <div class="error">Collecting network path data for {{ dest }}... Please wait.</div>
+        {% else %}
+            <div class="path-container">
+                <div class="network-path" id="networkPath">
+                    {% for hop in latest_hops %}
+                        <div class="hop">
+                            <div class="hop-node {{ hop_stats[hop.count].status }}" 
+                                 title="Hop {{ hop.count }}: {{ hop.host }}"
+                                 onclick="toggleHopDetails({{ hop.count }})">
+                                {{ hop.count }}
+                            </div>
+                            <div class="hop-info" id="hop-{{ hop.count }}">
+                                <div class="hop-host">{{ hop.host }}</div>
+                                <div class="hop-stats">
+                                    <div class="stat">
+                                        <span>Latency:</span>
+                                        <span class="stat-value">{{ hop.Avg }}ms</span>
+                                    </div>
+                                    <div class="stat">
+                                        <span>Loss:</span>
+                                        <span class="stat-value">{{ hop['Loss%'] }}%</span>
+                                    </div>
+                                    <div class="stat">
+                                        <span>5min Avg:</span>
+                                        <span class="stat-value">{{ hop_stats[hop.count].avg_latency }}ms</span>
+                                    </div>
+                                    <div class="stat">
+                                        <span>Jitter:</span>
+                                        <span class="stat-value">{{ hop_stats[hop.count].jitter }}ms</span>
+                                    </div>
+                                </div>
+                                
+                                <!-- Enhanced metadata display -->
+                                {% set hop_metadata_found = None %}
+                                {% for ip, metadata in hop_metadata.items() %}
+                                    {% if ip == hop.host or hop.host in ip or ip in hop.host %}
+                                        {% set hop_metadata_found = metadata %}
+                                    {% endif %}
+                                {% endfor %}
+                                
+                                {% if hop_metadata_found %}
+                                <div class="metadata-info-preview">
+                                    {% if hop_metadata_found.asn %}
+                                    <div class="metadata-row-small">
+                                        <span class="metadata-label">ASN:</span> {{ hop_metadata_found.asn }}
+                                    </div>
+                                    {% endif %}
+                                    {% if hop_metadata_found.organization %}
+                                    <div class="metadata-row-small">
+                                        <span class="metadata-label">Org:</span> {{ hop_metadata_found.organization[:30] }}{% if hop_metadata_found.organization|length > 30 %}...{% endif %}
+                                    </div>
+                                    {% endif %}
+                                    {% if hop_metadata_found.provider and hop_metadata_found.provider != hop_metadata_found.organization %}
+                                    <div class="metadata-row-small">
+                                        <span class="metadata-label">ISP:</span> {{ hop_metadata_found.provider[:25] }}{% if hop_metadata_found.provider|length > 25 %}...{% endif %}
+                                    </div>
+                                    {% endif %}
+                                    {% if hop_metadata_found.country %}
+                                    <div class="metadata-row-small">
+                                        <span class="metadata-label">Location:</span> 
+                                        {% if hop_metadata_found.city %}{{ hop_metadata_found.city }}, {% endif %}
+                                        {% if hop_metadata_found.region and hop_metadata_found.region != hop_metadata_found.city %}{{ hop_metadata_found.region }}, {% endif %}
+                                        {{ hop_metadata_found.country }}
+                                    </div>
+                                    {% endif %}
+                                    {% if hop_metadata_found.ping_stats %}
+                                    <div class="metadata-row-small">
+                                        <span class="metadata-label">Ping Avg:</span> {{ "%.1f"|format(hop_metadata_found.ping_stats.avg) }}ms
+                                        {% if hop_metadata_found.ping_packet_loss is not none and hop_metadata_found.ping_packet_loss > 0 %}
+                                        ({{ hop_metadata_found.ping_packet_loss }}% loss)
+                                        {% endif %}
+                                    </div>
+                                    {% endif %}
+                                    
+                                    <button class="metadata-expand" onclick="toggleMetadataDetails({{ hop.count }})">
+                                        Show More Details
+                                    </button>
+                                </div>
+                                
+                                <!-- Detailed metadata - initially hidden -->
+                                <div class="metadata-info-detailed" id="metadata-details-{{ hop.count }}">
+                                    {% if hop_metadata_found.hostname %}
+                                    <div class="metadata-row">
+                                        <span class="metadata-label">Hostname:</span> {{ hop_metadata_found.hostname }}
+                                    </div>
+                                    {% endif %}
+                                    {% if hop_metadata_found.ping_stats %}
+                                    <div class="metadata-row">
+                                        <span class="metadata-label">Ping Min/Avg/Max/StdDev:</span> 
+                                        {{ "%.1f"|format(hop_metadata_found.ping_stats.min) }}/{{ "%.1f"|format(hop_metadata_found.ping_stats.avg) }}/{{ "%.1f"|format(hop_metadata_found.ping_stats.max) }}/{{ "%.1f"|format(hop_metadata_found.ping_stats.stddev) }}ms
+                                    </div>
+                                    {% endif %}
+                                    {% if hop_metadata_found.http_connectivity %}
+                                    <div class="metadata-row">
+                                        <span class="metadata-label">HTTP Port 80:</span> {{ hop_metadata_found.http_connectivity }}
+                                    </div>
+                                    {% endif %}
+                                    {% if hop_metadata_found.network_name %}
+                                    <div class="metadata-row">
+                                        <span class="metadata-label">Network:</span> {{ hop_metadata_found.network_name }}
+                                    </div>
+                                    {% endif %}
+                                </div>
+                                {% else %}
+                                <div class="metadata-info-preview">
+                                    <div class="metadata-row-small" style="color: #999; font-style: italic;">
+                                        {% if hop.host in ['Unknown', '???'] %}
+                                        No response from this hop
+                                        {% else %}
+                                        Collecting enhanced metadata for {{ hop.host }}...
+                                        <br><small>Debug: Available metadata for {{ hop_metadata.keys()|list|length }} IPs</small>
+                                        {% endif %}
+                                    </div>
+                                </div>
+                                {% endif %}
+                            </div>
+                        </div>
+                    {% endfor %}
+                </div>
+            </div>
+            
+            <div class="status-legend">
+                <div class="legend-item">
+                    <div class="legend-dot healthy"></div>
+                    <span>Healthy (No loss)</span>
+                </div>
+                <div class="legend-item">
+                    <div class="legend-dot minor"></div>
+                    <span>Minor Issues (< 5% loss)</span>
+                </div>
+                <div class="legend-item">
+                    <div class="legend-dot warning"></div>
+                    <span>Warning (5-10% loss or high latency)</span>
+                </div>
+                <div class="legend-item">
+                    <div class="legend-dot critical"></div>
+                    <span>Critical (> 10% loss)</span>
+                </div>
+            </div>
+            
+            <div class="charts-section">
+                <div class="chart-container">
+                    <h3 class="chart-title">Latency Trends - {{ dest }} (Last Hour)</h3>
+                    <div class="chart-wrapper">
+                        <canvas id="latencyChart"></canvas>
+                    </div>
+                </div>
+                <div class="chart-container">
+                    <h3 class="chart-title">Packet Loss Trends - {{ dest }} (Last Hour)</h3>
+                    <div class="chart-wrapper">
+                        <canvas id="lossChart"></canvas>
+                    </div>
+                </div>
+            </div>
+        {% endif %}
+        
+        <!-- AI Analytics Section -->
+        {% if analytics_enabled and ai_insights %}
+        <div class="ai-insights-section">
+            <h2 class="ai-insights-title">AI Network Intelligence Insights</h2>
+            {% for insight in ai_insights %}
+            <div class="insight-card {{ insight.health }}">
+                <div class="insight-content">
+                    {% if insight.issues %}
+                    <strong>Issues Detected:</strong> {{ ', '.join(insight.issues[:3]) }}
+                    {% endif %}
+                    {% if insight.root_cause %}
+                    <div><strong>Root Cause:</strong> {{ insight.root_cause }}</div>
+                    {% endif %}
+                    {% if insight.recommendations %}
+                    <div><strong>Recommendations:</strong> {{ '; '.join(insight.recommendations[:2]) }}</div>
+                    {% endif %}
+                </div>
+            </div>
+            {% endfor %}
+        </div>
+        {% elif analytics_enabled %}
+        <div class="ai-insights-section">
+            <h2 class="ai-insights-title">AI Network Intelligence Insights</h2>
+            <div class="insight-card">
+                <div class="insight-content">
+                    <p>AI Analytics are active but still gathering data. Insights will appear here once sufficient network data has been collected and analyzed.</p>
+                </div>
+            </div>
+        </div>
+        {% endif %}
+    </div>
+
+    <script>
+        function toggleMetadataDetails(hopId) {
+            const detailsDiv = document.getElementById(`metadata-details-${hopId}`);
+            const button = event.target;
+            
+            if (detailsDiv.style.display === 'none' || detailsDiv.style.display === '') {
+                detailsDiv.style.display = 'block';
+                button.textContent = 'Hide Details';
+            } else {
+                detailsDiv.style.display = 'none';
+                button.textContent = 'Show More Details';
+            }
+        }
+        
+        function toggleHopDetails(hopId) {
+            // Optional: Add any hop node interaction here
+            console.log(`Clicked hop ${hopId}`);
+        }
+        
+        function addConnectionLines() {
+            const path = document.getElementById('networkPath');
+            if (!path) return;
+            
+            path.querySelectorAll('.connection-line').forEach(line => line.remove());
+            const hops = path.querySelectorAll('.hop');
+            
+            for (let i = 0; i < hops.length - 1; i++) {
+                const currentHop = hops[i];
+                const nextHop = hops[i + 1];
+                const line = document.createElement('div');
+                line.className = 'connection-line';
+                
+                const currentRect = currentHop.getBoundingClientRect();
+                const nextRect = nextHop.getBoundingClientRect();
+                const pathRect = path.getBoundingClientRect();
+                
+                const startX = currentRect.right - pathRect.left;
+                const endX = nextRect.left - pathRect.left;
+                line.style.left = startX + 'px';
+                line.style.width = (endX - startX) + 'px';
+                path.appendChild(line);
+            }
+        }
+        
+        function updateTimestamp() {
+            const timeElement = document.getElementById('lastUpdate');
+            if (timeElement) {
+                timeElement.textContent = new Date().toLocaleTimeString();
+            }
+        }
+        
+        document.addEventListener('DOMContentLoaded', function() {
+            setTimeout(addConnectionLines, 100);
+            updateTimestamp();
+            setInterval(updateTimestamp, 1000);
+            
+            // Load metadata dynamically
+            loadMetadataForAllHops();
+            
+            window.addEventListener('resize', function() {
+                setTimeout(addConnectionLines, 100);
+            });
+        });
+        
+        function loadMetadataForAllHops() {
+            const currentDest = '{{ selected_destination }}';
+            
+            // Get all hop info divs
+            const hopInfoDivs = document.querySelectorAll('.hop-info');
+            
+            hopInfoDivs.forEach(function(hopDiv) {
+                const hopId = hopDiv.id.replace('hop-', '');
+                const hostElement = hopDiv.querySelector('.hop-host');
+                if (hostElement) {
+                    const hopHost = hostElement.textContent.trim();
+                    loadMetadataForHop(hopHost, hopId);
+                }
+            });
+        }
+        
+        function loadMetadataForHop(hopHost, hopId) {
+            fetch(`/api/hop-metadata/${encodeURIComponent('{{ selected_destination }}') }/${encodeURIComponent(hopHost)}`)
+                .then(response => response.json())
+                .then(metadata => {
+                    if (!metadata.error && (metadata.asn || metadata.organization || metadata.country)) {
+                        displayMetadata(hopId, metadata, hopHost);
+                    } else {
+                        // Check if we have ping stats only
+                        if (!metadata.error && metadata.ping_stats) {
+                            displayPingOnly(hopId, metadata, hopHost);
+                        }
+                    }
+                })
+                .catch(error => {
+                    console.log(`No metadata available for ${hopHost}`);
+                });
+        }
+        
+        function displayMetadata(hopId, metadata, hopHost) {
+            const hopDiv = document.getElementById(`hop-${hopId}`);
+            if (!hopDiv) return;
+            
+            // Remove any existing metadata preview
+            const existingPreview = hopDiv.querySelector('.metadata-info-preview');
+            if (existingPreview) {
+                existingPreview.remove();
+            }
+            
+            let metadataHtml = '<div class="metadata-info-preview">';
+            
+            if (metadata.asn) {
+                metadataHtml += `<div class="metadata-row-small"><span class="metadata-label">ASN:</span> ${metadata.asn}</div>`;
+            }
+            
+            if (metadata.organization) {
+                const orgDisplay = metadata.organization.length > 30 ? metadata.organization.substring(0, 30) + '...' : metadata.organization;
+                metadataHtml += `<div class="metadata-row-small"><span class="metadata-label">Org:</span> ${orgDisplay}</div>`;
+            }
+            
+            if (metadata.provider && metadata.provider !== metadata.organization) {
+                const providerDisplay = metadata.provider.length > 25 ? metadata.provider.substring(0, 25) + '...' : metadata.provider;
+                metadataHtml += `<div class="metadata-row-small"><span class="metadata-label">ISP:</span> ${providerDisplay}</div>`;
+            }
+            
+            if (metadata.country) {
+                let location = '';
+                if (metadata.city) location += metadata.city + ', ';
+                if (metadata.region && metadata.region !== metadata.city) location += metadata.region + ', ';
+                location += metadata.country;
+                metadataHtml += `<div class="metadata-row-small"><span class="metadata-label">Location:</span> ${location}</div>`;
+            }
+            
+            if (metadata.ping_stats) {
+                let pingText = `${metadata.ping_stats.avg.toFixed(1)}ms`;
+                if (metadata.ping_packet_loss && metadata.ping_packet_loss > 0) {
+                    pingText += ` (${metadata.ping_packet_loss}% loss)`;
+                }
+                metadataHtml += `<div class="metadata-row-small"><span class="metadata-label">Ping Avg:</span> ${pingText}</div>`;
+            }
+            
+            metadataHtml += `<button class="metadata-expand" onclick="toggleMetadataDetails(${hopId})">Show More Details</button>`;
+            metadataHtml += '</div>';
+            
+            // Add detailed metadata section
+            metadataHtml += `<div class="metadata-info-detailed" id="metadata-details-${hopId}">`;
+            
+            if (metadata.hostname) {
+                metadataHtml += `<div class="metadata-row"><span class="metadata-label">Hostname:</span> ${metadata.hostname}</div>`;
+            }
+            
+            if (metadata.ping_stats) {
+                metadataHtml += `<div class="metadata-row"><span class="metadata-label">Ping Min/Avg/Max/StdDev:</span> ${metadata.ping_stats.min.toFixed(1)}/${metadata.ping_stats.avg.toFixed(1)}/${metadata.ping_stats.max.toFixed(1)}/${metadata.ping_stats.stddev.toFixed(1)}ms</div>`;
+            }
+            
+            if (metadata.http_connectivity) {
+                metadataHtml += `<div class="metadata-row"><span class="metadata-label">HTTP Port 80:</span> ${metadata.http_connectivity}</div>`;
+            }
+            
+            if (metadata.network_name) {
+                metadataHtml += `<div class="metadata-row"><span class="metadata-label">Network:</span> ${metadata.network_name}</div>`;
+            }
+            
+            metadataHtml += '</div>';
+            
+            hopDiv.insertAdjacentHTML('beforeend', metadataHtml);
+        }
+        
+        function displayPingOnly(hopId, metadata, hopHost) {
+            const hopDiv = document.getElementById(`hop-${hopId}`);
+            if (!hopDiv) return;
+            
+            // Remove any existing metadata preview
+            const existingPreview = hopDiv.querySelector('.metadata-info-preview');
+            if (existingPreview) {
+                existingPreview.remove();
+            }
+            
+            let metadataHtml = '<div class="metadata-info-preview">';
+            
+            if (metadata.ping_stats) {
+                let pingText = `${metadata.ping_stats.avg.toFixed(1)}ms`;
+                if (metadata.ping_packet_loss && metadata.ping_packet_loss > 0) {
+                    pingText += ` (${metadata.ping_packet_loss}% loss)`;
+                }
+                metadataHtml += `<div class="metadata-row-small"><span class="metadata-label">Ping Avg:</span> ${pingText}</div>`;
+            }
+            
+            metadataHtml += '<div class="metadata-row-small" style="color: #888; font-style: italic;">Private/internal IP - limited metadata</div>';
+            metadataHtml += '</div>';
+            
+            hopDiv.insertAdjacentHTML('beforeend', metadataHtml);
+        }
+        
+        // Chart rendering
+        {% if latest_hops and history_data %}
+        const historyData = {{ history_json | safe }};
+        
+        function processChartData(forLatency = true) {
+            const hopMap = new Map();
+            const colors = [
+                'rgb(46, 204, 113)', 'rgb(52, 152, 219)', 'rgb(155, 89, 182)',
+                'rgb(241, 196, 15)', 'rgb(230, 126, 34)', 'rgb(231, 76, 60)',
+                'rgb(149, 165, 166)', 'rgb(26, 188, 156)', 'rgb(142, 68, 173)'
+            ];
+            
+            historyData.forEach(entry => {
+                if (entry.hops) {
+                    entry.hops.forEach(hop => {
+                        const hopId = `Hop ${hop.count}: ${hop.host}`;
+                        if (!hopMap.has(hopId)) {
+                            hopMap.set(hopId, []);
+                        }
+                        const value = forLatency ? hop['Avg'] : hop['Loss%'];
+                        hopMap.get(hopId).push({x: entry.ts * 1000, y: value});
+                    });
+                }
+            });
+            
+            let colorIndex = 0;
+            return Array.from(hopMap.entries()).map(([label, data]) => ({
+                label, data, fill: false,
+                borderColor: colors[colorIndex++ % colors.length],
+                backgroundColor: colors[(colorIndex - 1) % colors.length] + '20',
+                tension: 0.4, borderWidth: 2, pointRadius: 1, pointHoverRadius: 4
+            }));
+        }
+
+        const latencyDatasets = processChartData(true);
+        const lossDatasets = processChartData(false);
+
+        if (document.getElementById('latencyChart')) {
+            new Chart(document.getElementById('latencyChart'), {
+                type: 'line', data: { datasets: latencyDatasets },
+                options: {
+                    responsive: true, maintainAspectRatio: false,
+                    interaction: { intersect: false, mode: 'index' },
+                    scales: {
+                        x: { type: 'time', time: { unit: 'minute' }, grid: { color: 'rgba(0,0,0,0.05)' } },
+                        y: { beginAtZero: true, title: { display: true, text: 'Latency (ms)', color: '#7f8c8d' }, grid: { color: 'rgba(0,0,0,0.05)' }, ticks: { color: '#7f8c8d' } }
+                    },
+                    plugins: { legend: { position: 'bottom', labels: { usePointStyle: true, padding: 15 } } },
+                    elements: { point: { radius: 0 } }
+                }
+            });
+        }
+
+        if (document.getElementById('lossChart')) {
+            new Chart(document.getElementById('lossChart'), {
+                type: 'line', data: { datasets: lossDatasets },
+                options: {
+                    responsive: true, maintainAspectRatio: false,
+                    interaction: { intersect: false, mode: 'index' },
+                    scales: {
+                        x: { type: 'time', time: { unit: 'minute' }, grid: { color: 'rgba(0,0,0,0.05)' } },
+                        y: { beginAtZero: true, max: 100, title: { display: true, text: 'Packet Loss (%)', color: '#7f8c8d' }, grid: { color: 'rgba(0,0,0,0.05)' }, ticks: { stepSize: 10, color: '#7f8c8d' } }
+                    },
+                    plugins: { legend: { position: 'bottom', labels: { usePointStyle: true, padding: 15 } } },
+                    elements: { point: { radius: 0 } }
+                }
+            });
+        }
+        {% endif %}
+    </script>
+</body>
+</html>
+"""
+
+def main(args, password):
+    app.start_time = time.time()
+    destinations = args.dest[:3]
+    
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    
+    try:
+        print(f"Connecting to {args.host}:{args.port}...")
+        client.connect(args.host, port=args.port, username=args.user, password=password, timeout=args.timeout)
+        print("SSH connection established successfully")
+    except Exception as e:
+        print(f"SSH connection failed: {str(e)}")
+        sys.exit(1)
+
+    mtr_available, mtr_message = test_mtr_availability(client)
+    if not mtr_available:
+        print(f"Error: {mtr_message}")
+        sys.exit(1)
+    else:
+        print(f"Success: {mtr_message}")
+
+    print(f"Starting Enhanced MTR with Rich Metadata for {len(destinations)} destination(s):")
+    for dest in destinations:
+        print(f"  - {dest}")
+
+    if args.enable_analytics and ai_analytics_available:
+        success = start_ai_analytics()
+        if not success:
+            print("Warning: AI Analytics failed to start. Continuing with monitoring...")
+
+    threads = []
+    for dest in destinations:
+        print(f"Starting MTR thread for destination: {dest}")
+        thread = threading.Thread(
+            target=mtr_loop_for_dest, 
+            args=(client, dest, args.host, args.enable_metadata), 
+            daemon=True
+        )
+        thread.start()
+        threads.append(thread)
+
+    print(f"Starting enhanced web server on http://localhost:{args.web_port}")
+    print("Enhanced features:")
+    print("  - Rich metadata collection for each hop (ASN, organization, geolocation)")
+    print("  - Multiple API sources for improved data reliability")
+    print("  - Enhanced whois fallback with multiple RIR servers")
+    print("  - Detailed ISP/provider information")
+    print("  - Region/state geographic data")
+    print("  - Expandable metadata details in web interface")
+    print("  - Improved connectivity tests and statistics")
+    
+    try:
+        app.run(host='0.0.0.0', port=args.web_port, debug=False, use_reloader=False)
+    except KeyboardInterrupt:
+        print("\nShutting down...")
+    except Exception as e:
+        print(f"Web server error: {e}")
+    finally:
+        client.close()
+
+if __name__ == '__main__':
+    args = parse_args()
+    password = getpass.getpass("Enter SSH password: ")
+    main(args, password)
